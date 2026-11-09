@@ -49,7 +49,7 @@ BOT_FILE = r"D:\影刀指令库\影刀_测试_26.11.1.bot"   # 待处理的 .bot
 NEW_UUID = None                      # 新的指令集 id / uuid；None = 不改
 NEW_VERSION = "1.0.1"                # 新版本号；None = 不改
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
-RUNTIME_DLL = "E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
+RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
 DOTNET_EXE = None                    # None = 自动探测 dotnet.exe（不依赖 PATH）
 TFM = None                           # None = 按已装 SDK 自动选（如 net10.0）；可填 net8.0
 DO_SIGN = True                       # True = 改完重签；False = 只改包
@@ -154,17 +154,45 @@ class Program
 
         var parentDir = Directory.GetParent(projectDir)!.FullName;
         var dirName = Path.GetFileName(projectDir);
-        var package = CreatePackage(packageType, appInfoType, appInfo, parentDir, dirName);
+        object package;
+        try
+        {
+            package = CreatePackage(packageType, appInfoType, appInfo, parentDir, dirName);
+        }
+        catch (Exception first) when (IsCorrupt(first))
+        {
+            var signature = Path.Combine(projectDir, "package.sigstore");
+            if (!File.Exists(signature)) throw;
+            var parked = Path.Combine(Path.GetTempPath(),
+                "botsig-" + Guid.NewGuid().ToString("N") + ".bak");
+            File.Move(signature, parked);
+            Console.WriteLine("warn=构造报损坏，临时移走 package.sigstore 后重试: " + parked);
+            package = CreatePackage(packageType, appInfoType, appInfo, parentDir, dirName);
+        }
 
         var test = FindSigstoreMethod(helperType, "TestPackageSigstore");
         var write = FindSigstoreMethod(helperType, "WritePackageSigstore");
 
-        Console.WriteLine("before=" + test.Invoke(null, new[] { package }));
+        object? before;
+        try { before = test.Invoke(null, new[] { package }); }
+        catch (Exception ex) { before = "error:" + ex.GetBaseException().Message; }
+        Console.WriteLine("before=" + before);
         if (args.Length >= 3 && args[2] == "write")
         {
             write.Invoke(null, new[] { package });
-            Console.WriteLine("after=" + test.Invoke(null, new[] { package }));
+            object? after;
+            try { after = test.Invoke(null, new[] { package }); }
+            catch (Exception ex) { after = "error:" + ex.GetBaseException().Message; }
+            Console.WriteLine("after=" + after);
         }
+    }
+
+    static bool IsCorrupt(Exception ex)
+    {
+        var text = ex.ToString();
+        return text.IndexOf("损坏", StringComparison.Ordinal) >= 0
+            || text.IndexOf("corrupt", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("PackageUnreadable", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     static void SetStringProperty(Type type, object instance, string[] candidates, string value)
@@ -186,14 +214,24 @@ class Program
     static object CreatePackage(Type packageType, Type appInfoType, object appInfo,
                                 string parentDir, string dirName)
     {
-        var exact = packageType.GetConstructor(
+        var exact5 = packageType.GetConstructor(
             new[] { typeof(string), appInfoType, typeof(bool?), typeof(string), typeof(bool) });
-        if (exact != null)
+        if (exact5 != null)
         {
             Console.WriteLine("ctor used=exact 5-arg signature");
-            return exact.Invoke(new object?[] { parentDir, appInfo, null, dirName, false })!;
+            Console.WriteLine("ctor args=rootPath=" + parentDir + " | targetPath=" + dirName);
+            return exact5.Invoke(new object?[] { parentDir, appInfo, null, dirName, false })!;
         }
-        Console.WriteLine("warn=exact 5-arg signature not found, probing constructors");
+
+        var exact4 = packageType.GetConstructor(
+            new[] { typeof(string), appInfoType, typeof(bool?), typeof(string) });
+        if (exact4 != null)
+        {
+            Console.WriteLine("ctor used=exact 4-arg signature (5.25.x)");
+            Console.WriteLine("ctor args=rootPath=" + parentDir + " | targetPath=" + dirName);
+            return exact4.Invoke(new object?[] { parentDir, appInfo, null, dirName })!;
+        }
+        Console.WriteLine("warn=no known signature, probing constructors");
 
         var constructors = packageType.GetConstructors(
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
@@ -207,25 +245,12 @@ class Program
             for (int i = 0; i < ps.Length; i++)
             {
                 var t = ps[i].ParameterType;
-                var n = ps[i].Name ?? "";
                 if (t == appInfoType || (t.IsAssignableFrom(appInfoType) && t != typeof(object)))
                     vals[i] = appInfo;
                 else if (t == typeof(string))
-                {
-                    if (n.IndexOf("name", StringComparison.OrdinalIgnoreCase) >= 0
-                        || n.IndexOf("folder", StringComparison.OrdinalIgnoreCase) >= 0)
-                        vals[i] = dirName;
-                    else if (n.IndexOf("root", StringComparison.OrdinalIgnoreCase) >= 0
-                        || n.IndexOf("parent", StringComparison.OrdinalIgnoreCase) >= 0
-                        || n.IndexOf("base", StringComparison.OrdinalIgnoreCase) >= 0
-                        || n.IndexOf("path", StringComparison.OrdinalIgnoreCase) >= 0
-                        || n.IndexOf("dir", StringComparison.OrdinalIgnoreCase) >= 0)
-                        vals[i] = parentDir;
-                    else
-                        vals[i] = stringCount++ == 0 ? parentDir : dirName;
-                }
+                    vals[i] = stringCount++ == 0 ? parentDir : dirName;
+                else if (Nullable.GetUnderlyingType(t) != null) vals[i] = null;
                 else if (t == typeof(bool)) vals[i] = false;
-                else if (t == typeof(bool?)) vals[i] = null;
                 else if (t == typeof(int)) vals[i] = 0;
                 else if (t == typeof(long)) vals[i] = 0L;
                 else if (t.IsValueType) { skip = true; break; }
@@ -237,6 +262,8 @@ class Program
                 var instance = ctor.Invoke(vals);
                 Console.WriteLine("ctor used=" + string.Join(",",
                     ps.Select(p => p.ParameterType.Name + " " + p.Name)));
+                Console.WriteLine("ctor args=" + string.Join(" | ", ps.Select(
+                    (p, idx) => p.Name + "=" + (vals[idx] == null ? "<null>" : vals[idx]!.ToString()))));
                 return instance!;
             }
             catch (Exception ex)
@@ -418,7 +445,10 @@ def resign(project_dir: Path, runtime: Path, backup_root: Path,
             300,
         )
         for line in out.splitlines():
-            print("  " + line.strip())
+            stripped = line.strip()
+            if stripped.startswith("CSC : warning"):
+                continue
+            print("  " + stripped)
         if code != 0:
             raise RuntimeError(
                 f"重签失败（目标框架 {tfm}）：\n--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
