@@ -56,7 +56,7 @@ NEW_VERSION = "auto"                 # "auto" = 原版本末位 +1；也可填 "
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
 SCAN_DIR = None                      # None = exe 所在文件夹；可填绝对路径
 OUTPUT_DIR = "repacked"              # 输出子目录名（相对扫描目录）
-RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
+RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # 低优先级回退；共享目录部署时优先用 exe 同目录的 DLL
 DOTNET_EXE = None                    # None = 自动探测 dotnet.exe（不依赖 PATH）
 TFM = None                           # None = 按已装 SDK 自动选（如 net10.0）；可填 net8.0
 DO_SIGN = True                       # True = 改完重签；False = 只改包
@@ -118,6 +118,13 @@ class Program
                     .OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase));
         }
         probeDirectories.Add(Path.Combine(runtimeDir, "support_x64", "ProcessLauncher"));
+
+        if (args.Length >= 4)
+        {
+            foreach (var extra in args[3].Split(';', StringSplitOptions.RemoveEmptyEntries))
+                if (Directory.Exists(extra) && !probeDirectories.Contains(extra))
+                    probeDirectories.Add(extra);
+        }
 
         AssemblyLoadContext.Default.Resolving += (_, name) =>
         {
@@ -317,34 +324,78 @@ def run_console(cmd: list[str], timeout: int) -> tuple[int, str, str]:
     return result.returncode, decode_console(result.stdout), decode_console(result.stderr)
 
 
-def find_runtime(explicit: str | None) -> Path:
-    """定位 ShadowBot.Runtime.dll；显式路径优先，否则按版本选最新安装。"""
-    if explicit:
-        path = Path(explicit).expanduser().resolve()
-        if not path.is_file():
-            raise RuntimeError(f"指定的 Runtime DLL 不存在：{path}")
-        return path
+def runtime_candidates(explicit: str | None, base_dir: Path) -> list[Path]:
+    """按优先级返回 ShadowBot.Runtime.dll 候选；重签失败时由 resign() 逐个回退。
 
-    roots = [
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "ShadowBot",
-        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "ShadowBot",
-    ]
-    candidates: list[tuple[tuple[int, ...], Path]] = []
-    for root in roots:
+    优先级：--runtime-dll 显式 > exe 同目录 > exe 同目录/runtime/ > 配置区 > 本机安装目录。
+    """
+    result: list[Path] = []
+
+    def add(path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            return
+        if resolved.is_file() and resolved not in result:
+            result.append(resolved)
+
+    if explicit:
+        given = Path(explicit).expanduser().resolve()
+        if not given.is_file():
+            raise RuntimeError(f"指定的 Runtime DLL 不存在：{given}")
+        add(given)
+
+    add(base_dir / "ShadowBot.Runtime.dll")
+    add(base_dir / "runtime" / "ShadowBot.Runtime.dll")
+    if RUNTIME_DLL:
+        add(Path(RUNTIME_DLL))
+
+    installed: list[tuple[tuple[int, ...], Path]] = []
+    for env_key, fallback in (("ProgramFiles", r"C:\Program Files"),
+                              ("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        root = Path(os.environ.get(env_key, fallback)) / "ShadowBot"
         if not root.is_dir():
             continue
         for child in root.iterdir():
             dll = child / "ShadowBot.Runtime.dll"
             if child.is_dir() and dll.is_file():
                 nums = tuple(int(n) for n in re.findall(r"\d+", child.name)[:4])
-                candidates.append((nums, dll))
-    if not candidates:
+                installed.append((nums, dll))
+    for _, dll in sorted(installed, key=lambda item: item[0], reverse=True):
+        add(dll)
+
+    if not result:
         raise RuntimeError(
-            "未找到 ShadowBot.Runtime.dll。请用 --runtime-dll 手动指定， "
-            "例如 C:\\Program Files\\ShadowBot\\shadowbot-5.25.66\\ShadowBot.Runtime.dll"
+            "未找到 ShadowBot.Runtime.dll。请把该文件放到 exe 同目录（建议连同同目录其它 "
+            "ShadowBot*.dll 一起拷贝，或整套放进 exe 同目录的 runtime/ 子文件夹），"
+            "也可用 --runtime-dll 指定本机安装路径。"
         )
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    return result
+
+
+def runtime_probe_dirs(runtimes: list[Path]) -> list[str]:
+    """收集候选目录与影刀自带 .NET 运行时目录，供 C# 端解析程序集依赖。"""
+    result: list[str] = []
+
+    def add(path: Path) -> None:
+        if path.is_dir() and str(path) not in result:
+            result.append(str(path))
+
+    for dll in runtimes:
+        root = dll.parent
+        add(root)
+        add(root / "support_x64" / "ProcessLauncher")
+        for base in (root, root.parent):
+            for sub in ("dotnet.win-x64/shared/Microsoft.WindowsDesktop.App",
+                        "dotnet.win-x64/shared/Microsoft.NETCore.App"):
+                shared = base / sub
+                if shared.is_dir():
+                    for version_dir in shared.iterdir():
+                        if version_dir.is_dir():
+                            add(version_dir)
+    return result
 
 
 def find_dotnet(explicit: str | None) -> tuple[Path, str]:
@@ -561,9 +612,9 @@ def patch_package_json(package_dir: Path, new_uuid: str | None, new_version: str
     print("  相关字段: " + ", ".join(f"{k}={data[k]!r}" for k in keys))
 
 
-def resign(project_dir: Path, runtime: Path, backup_root: Path,
+def resign(project_dir: Path, runtimes: list[Path], backup_root: Path,
            dotnet: Path, tfm: str) -> None:
-    """调用影刀自己的 Runtime 生成 package.sigstore。"""
+    """逐个尝试 Runtime 候选，用影刀自己的 API 重新生成 package.sigstore。"""
     sigstore = project_dir / "package.sigstore"
     if sigstore.exists():
         backup_root.mkdir(parents=True, exist_ok=True)
@@ -572,31 +623,40 @@ def resign(project_dir: Path, runtime: Path, backup_root: Path,
         shutil.copy2(sigstore, backup)
         print(f"  已备份原签名: {backup}")
 
+    probe_arg = ";".join(runtime_probe_dirs(runtimes)) or "-"
     temp = Path(tempfile.mkdtemp(prefix="bot-sigstore-"))
     try:
         (temp / "SigstoreRepair.csproj").write_text(
             CS_PROJECT.replace("{tfm}", tfm), encoding="utf-8")
         (temp / "Program.cs").write_text(CS_PROGRAM, encoding="utf-8")
-        code, out, err = run_console(
-            [str(dotnet), "run", "--project", str(temp / "SigstoreRepair.csproj"),
-             "--configuration", "Release", "--", str(runtime), str(project_dir), "write"],
-            300,
+        failures: list[str] = []
+        for runtime in runtimes:
+            print(f"  尝试 Runtime: {runtime}")
+            code, out, err = run_console(
+                [str(dotnet), "run", "--project", str(temp / "SigstoreRepair.csproj"),
+                 "--configuration", "Release", "--",
+                 str(runtime), str(project_dir), "write", probe_arg],
+                300,
+            )
+            for line in out.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("CSC : warning"):
+                    continue
+                print("  " + stripped)
+            if code == 0 and "before=" in out and "after=True" in out:
+                return
+            reason = (err.strip() or out.strip() or f"exit={code}")[:800]
+            failures.append(f"- {runtime}: {reason}")
+            print("  [失败] 该 Runtime 重签未成功，尝试下一个候选")
+            if not sigstore.exists():
+                backups = sorted(backup_root.glob(f"{project_dir.name}.package.sigstore.*.bak"))
+                if backups:
+                    shutil.copy2(backups[-1], sigstore)
+        raise RuntimeError(
+            "重签失败，所有 Runtime 候选均未通过：\n" + "\n".join(failures) +
+            "\n建议把影刀版本目录下的全部 DLL 拷到 exe 同目录的 runtime/ 文件夹，"
+            "或用 --runtime-dll 指定本机安装路径。"
         )
-        for line in out.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("CSC : warning"):
-                continue
-            print("  " + stripped)
-        if code != 0:
-            raise RuntimeError(
-                f"重签失败（目标框架 {tfm}）：\n--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
-                "若提示缺少参考包，可试 --tfm net8.0 / net10.0。"
-            )
-        if "before=" not in out or "after=True" not in out:
-            raise RuntimeError(
-                f"重签未得到 after=True，请检查影刀版本与 Runtime 是否匹配。\n"
-                f"--- stdout ---\n{out}\n--- stderr ---\n{err}"
-            )
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
@@ -609,7 +669,7 @@ def repack(extract_root: Path, output: Path) -> None:
 
 
 def process(bot: Path, new_uuid: str | None, new_version: str | None,
-            output: Path | None, runtime: Path | None, do_sign: bool,
+            output: Path | None, runtimes: list[Path], do_sign: bool,
             dry_run: bool, backup_root: Path, dotnet: Path | None = None,
             tfm: str = "net10.0", inspect: bool = False,
             old_code: str | None = None, new_code: str | None = None) -> None:
@@ -662,7 +722,7 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
         package_dir = locate_package_dir(root)
         patch_package_json(package_dir, new_uuid, new_version)
         if do_sign:
-            resign(package_dir, runtime, backup_root, dotnet, tfm)
+            resign(package_dir, runtimes, backup_root, dotnet, tfm)
         else:
             print("  [警告] 跳过重签；若导入后打开报「应用文件已损坏」，请去掉 --no-sign。")
 
@@ -684,7 +744,8 @@ def main() -> int:
     parser.add_argument("--output", default=OUTPUT_FILE, help="输出 .bot 路径（仅单文件模式）")
     parser.add_argument("--new-uuid", default=NEW_UUID, help='新 uuid；"auto" = 自动生成')
     parser.add_argument("--new-version", default=NEW_VERSION, help='"auto" = 版本末位 +1')
-    parser.add_argument("--runtime-dll", default=RUNTIME_DLL, help="ShadowBot.Runtime.dll 路径")
+    parser.add_argument("--runtime-dll", default=None,
+                        help="手动指定（最高优先级）；默认依次尝试同目录、配置区、本机安装目录")
     parser.add_argument("--dotnet", default=DOTNET_EXE, help="dotnet.exe 绝对路径")
     parser.add_argument("--tfm", default=TFM, help="目标框架，如 net8.0 / net10.0")
     parser.add_argument("--old-code", default=OLD_CODE, help="旧指令集编码")
@@ -699,9 +760,11 @@ def main() -> int:
     backup_root = app_dir() / "_sigstore_backups"
 
     try:
-        runtime = find_runtime(args.runtime_dll) if do_sign else None
-        if runtime:
-            print(f"Runtime: {runtime}")
+        runtimes = runtime_candidates(args.runtime_dll, app_dir()) if do_sign else []
+        if runtimes:
+            print(f"Runtime 候选（按顺序尝试，共 {len(runtimes)} 个）:")
+            for item in runtimes:
+                print(f"  - {item}")
         dotnet = None
         tfm = args.tfm or TFM or "net10.0"
         if do_sign:
@@ -712,7 +775,7 @@ def main() -> int:
             bot = Path(args.bot).expanduser()
             output = Path(args.output).expanduser() if args.output else None
             process(bot, args.new_uuid, args.new_version, output,
-                    runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
+                    runtimes, do_sign, args.dry_run, backup_root, dotnet, tfm,
                     args.inspect, args.old_code, args.new_code)
             return 0
 
@@ -737,7 +800,7 @@ def main() -> int:
             target = unique_output_path(out_dir, bot.name) if not no_write else None
             try:
                 process(bot, args.new_uuid, args.new_version, target,
-                        runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
+                        runtimes, do_sign, args.dry_run, backup_root, dotnet, tfm,
                         args.inspect, args.old_code, args.new_code)
             except Exception as exc:
                 failures.append((bot.name, str(exc)))

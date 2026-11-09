@@ -18,7 +18,7 @@
 | --- | --- |
 | Windows + Python 3.10+ | 用于打包（源码用了 `str \| None` 类型注解） |
 | PyInstaller | `pip install pyinstaller` |
-| 影刀客户端 | 提供 `ShadowBot.Runtime.dll`，用于重新生成签名 |
+| 影刀客户端 | 提供 `ShadowBot.Runtime.dll`；共享目录部署时可直接把 DLL 拷到 exe 同目录，见第五节 |
 | .NET SDK 8 / 9 / 10 | 编译重签用的临时 C# 程序；脚本会自动探测 `dotnet.exe` |
 
 exe 本身**不打包** .NET SDK 和影刀 Runtime，这两样必须装在运行的机器上。
@@ -49,6 +49,8 @@ RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runti
 | `TFM` | `None` | 按已装 SDK 自动选；可强制 `net8.0` / `net10.0` |
 
 注意 `RUNTIME_DLL` 用了 `r"..."` 原始字符串，路径里的反斜杠不会被当成转义符。
+
+> 如果 exe 要放到**公司共享目录给同事用**，这个本机路径在别人电脑上不存在，不必改：脚本会优先使用 exe 同目录的 `ShadowBot.Runtime.dll`，详见「五、共享目录部署」。
 
 ---
 
@@ -127,12 +129,47 @@ python bot_repack.py --no-sign
 | `--new-uuid` / `--new-code` / `--new-version` | 覆盖配置区的身份策略 |
 | `--old-code` | 显式指定旧指令集编码 |
 | `--dotnet PATH` / `--tfm TFM` | 手动指定 .NET 与编译目标框架 |
-| `--runtime-dll PATH` | 手动指定 `ShadowBot.Runtime.dll` |
+| `--runtime-dll PATH` | 手动指定 `ShadowBot.Runtime.dll`（最高优先级） |
 | `--inspect` / `--dry-run` / `--no-sign` | 诊断与实验模式 |
 
 ---
 
-## 五、处理流程
+## 五、共享目录部署（多人使用）
+
+把 exe 放到公司共享目录、同事直接在共享目录里运行时，配置区里的 `RUNTIME_DLL` 是你本机的绝对路径，在别人电脑上不存在。脚本按下面顺序自动查找 `ShadowBot.Runtime.dll`，**找到就用；重签失败会自动换下一个候选**：
+
+1. `--runtime-dll` 命令行显式指定
+2. **exe 同目录**的 `ShadowBot.Runtime.dll`
+3. **exe 同目录 `runtime\` 子文件夹**里的 `ShadowBot.Runtime.dll`
+4. 配置区 `RUNTIME_DLL`（你本机的安装路径）
+5. 本机 `C:\Program Files\ShadowBot\shadowbot-*\` 自动探测
+
+推荐目录结构：
+
+```
+\\公司共享目录\RPA工具\
+├── bot_repack.exe
+├── ShadowBot.Runtime.dll        ← 方案 A：只拷这一个（可能缺依赖）
+├── ShadowBot.Common.dll         ← 若 A 报依赖缺失，把同目录其它 DLL 一起拷
+├── ...其它 ShadowBot*.dll
+├── runtime\                     ← 方案 B：影刀版本目录里的全部 DLL（最稳）
+│   └── ShadowBot.Runtime.dll
+├── 指令A.bot
+├── repacked\                    ← 自动创建
+└── _sigstore_backups\           ← 自动创建（签名备份）
+```
+
+> **`ShadowBot.Runtime.dll` 不是孤立文件**：加载时还会解析同目录的其它影刀程序集，以及影刀自带的 .NET 运行时目录。只拷单个 DLL 可能因依赖缺失导致重签失败——这时脚本会自动回退到下一个候选；全部失败时会逐个打印错误并给出提示。
+>
+> 最可靠的是**方案 B**：把 `shadowbot-5.25.66\` 里的全部 DLL 拷进 exe 同目录的 `runtime\` 子文件夹，依赖齐全，同事电脑通常无需再装影刀客户端。但**仍需 .NET SDK**，因为重签要编译临时 C# 程序。
+>
+> 脚本会把所有候选目录及其 `dotnet.win-x64/shared/...` 子目录一并作为程序集探测路径传给重签程序，所以「同目录 DLL + 本机影刀安装目录」混合使用也能解析到依赖。
+>
+> 共享目录需要给使用者**写权限**（要创建 `repacked\` 与 `_sigstore_backups\`）。
+
+---
+
+## 六、处理流程
 
 1. 解包 `.bot`（本质是 zip），定位 `xbot_robot/package.json`。
 2. 生成新 `uuid`，并在**包内所有文本文件**中替换旧 uuid（`settings.json`、`xbot_extensions/` 等处也有引用）。
@@ -145,7 +182,7 @@ python bot_repack.py --no-sign
 
 ---
 
-## 六、注意事项
+## 七、注意事项
 
 - **合规**：仅用于处理你自己或你公司有权分发的指令。绕过产品约束前请确认不违反适用的许可协议。
 - **更省事的官方通道**：同一企业组织内分发，推荐走「我开发的指令 → 发版 → 分享至企业 → B 账号在『企业指令』安装」，天然支持一个指令集多账号安装，不需要生成多份文件。本工具适合跨组织、离线交付等场景。
