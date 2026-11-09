@@ -41,12 +41,15 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import uuid as uuidlib
 from datetime import datetime
 from pathlib import Path
 
 # ==================== 配置区：按需修改 ====================
 BOT_FILE = r"D:\影刀指令库\影刀_测试_26.11.1.bot"   # 待处理的 .bot 文件（单文件测试用）
-NEW_UUID = None                      # 新的指令集 id / uuid；None = 不改
+NEW_UUID = "auto"                    # "auto" = 每次生成全新 uuid（推荐）；None = 不改
+NEW_CODE = None                      # 新指令集编码；"auto" = 自动识别并替换 activity_xxx
+OLD_CODE = None                      # 显式指定旧编码（配合 new-code）；None = 自动识别
 NEW_VERSION = "1.0.1"                # 新版本号；None = 不改
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
 RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
@@ -405,18 +408,116 @@ def locate_package_dir(root: Path) -> Path:
     )
 
 
+TEXT_SUFFIXES = {".json", ".py", ".txt", ".xml", ".yaml", ".yml", ".md", ".js",
+                 ".ini", ".cfg", ".config", ".flow", ".bat", ".ps1"}
+SKIP_FILES = {"package.sigstore"}
+
+
+def iter_text_files(root: Path):
+    """只遍历可安全做字符串替换的文本文件；二进制/加密流程自动跳过。"""
+    for file in sorted(root.rglob("*")):
+        if not file.is_file() or file.name in SKIP_FILES:
+            continue
+        if file.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        try:
+            text = file.read_text(encoding="utf-8-sig")
+        except (UnicodeDecodeError, OSError):
+            continue
+        yield file, text
+
+
+def guess_activity_code(root: Path) -> str | None:
+    """从包内文本中找出出现最多的 activity_xxx 作为指令集编码。"""
+    counts: dict[str, int] = {}
+    for _, text in iter_text_files(root):
+        for code in set(re.findall(r"\bactivity_[A-Za-z0-9_]+\b", text)):
+            counts[code] = counts.get(code, 0) + text.count(code)
+    return max(counts, key=counts.get) if counts else None
+
+
+def replace_identity(root: Path, old_uuid: str | None, new_uuid: str | None,
+                     old_code: str | None, new_code: str | None) -> None:
+    """全包替换身份标识：只改 package.json 的 uuid 会留下内部引用不一致。"""
+    pairs = []
+    if old_uuid and new_uuid and old_uuid != new_uuid:
+        pairs.append((old_uuid, new_uuid, "uuid"))
+    if old_code and new_code and old_code != new_code:
+        pairs.append((old_code, new_code, "编码"))
+    if not pairs:
+        return
+    for file, text in iter_text_files(root):
+        updated, hits = text, []
+        for old, new, label in pairs:
+            count = updated.count(old)
+            if count:
+                updated = updated.replace(old, new)
+                hits.append(f"{label}x{count}")
+        if hits:
+            file.write_text(updated, encoding="utf-8")
+            print(f"  替换 {file.relative_to(root).as_posix()}: {', '.join(hits)}")
+
+
+def rename_identity_paths(root: Path, old_uuid: str | None, new_uuid: str | None,
+                          old_code: str | None, new_code: str | None) -> None:
+    """指令集编码常出现在目录名/文件名里（如 xbot_extensions/<code>/），同步重命名。"""
+    pairs = []
+    if old_uuid and new_uuid and old_uuid != new_uuid:
+        pairs.append((old_uuid, new_uuid))
+    if old_code and new_code and old_code != new_code:
+        pairs.append((old_code, new_code))
+    if not pairs:
+        return
+    entries = sorted([p for p in root.rglob("*")
+                      if any(old in p.name for old, _ in pairs)],
+                     key=lambda p: len(p.parts), reverse=True)
+    for path in entries:
+        new_name = path.name
+        for old, new in pairs:
+            new_name = new_name.replace(old, new)
+        if new_name == path.name:
+            continue
+        target = path.with_name(new_name)
+        if target.exists():
+            continue
+        path.rename(target)
+        print(f"  重命名: {path.relative_to(root).as_posix()} -> {target.name}")
+
+
+def inspect_bot(root: Path, package_dir: Path) -> None:
+    """列出包结构与身份标识，用于判断还需要改哪些字段。"""
+    data = json.loads((package_dir / "package.json").read_text(encoding="utf-8-sig"))
+    scalars = {k: v for k, v in data.items() if not isinstance(v, (dict, list))}
+    print("  package.json 标量字段: " + ", ".join(f"{k}={v!r}" for k, v in scalars.items()))
+    files = [f for f in sorted(root.rglob("*")) if f.is_file()]
+    print(f"  包内文件({len(files)}):")
+    for file in files[:60]:
+        print(f"    {file.relative_to(root).as_posix()}")
+    if len(files) > 60:
+        print(f"    ... 另有 {len(files) - 60} 个")
+    code = guess_activity_code(root)
+    print(f"  疑似指令集编码: {code or '未找到 activity_ 前缀字符串'}")
+    old_uuid = data.get("uuid")
+    if old_uuid:
+        locations = [f.relative_to(root).as_posix()
+                     for f, text in iter_text_files(root) if old_uuid in text]
+        print(f"  旧 uuid 出现位置: {', '.join(locations) if locations else '未出现在文本文件中'}")
+
+
 def patch_package_json(package_dir: Path, new_uuid: str | None, new_version: str | None) -> None:
     path = package_dir / "package.json"
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     changed = []
     if new_uuid:
         old = data.get("uuid")
-        data["uuid"] = new_uuid
-        changed.append(f"uuid: {old} -> {new_uuid}")
+        if old != new_uuid:
+            data["uuid"] = new_uuid
+            changed.append(f"uuid: {old} -> {new_uuid}")
     if new_version:
         old = data.get("version")
-        data["version"] = new_version
-        changed.append(f"version: {old} -> {new_version}")
+        if old != new_version:
+            data["version"] = new_version
+            changed.append(f"version: {old} -> {new_version}")
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print("  修改: " + ("; ".join(changed) if changed else "无（仅重新打包）"))
     keys = [k for k in data if re.search(r"id|uuid|version", k, re.I)]
@@ -473,7 +574,8 @@ def repack(extract_root: Path, output: Path) -> None:
 def process(bot: Path, new_uuid: str | None, new_version: str | None,
             output: Path | None, runtime: Path | None, do_sign: bool,
             dry_run: bool, backup_root: Path, dotnet: Path | None = None,
-            tfm: str = "net10.0") -> None:
+            tfm: str = "net10.0", inspect: bool = False,
+            old_code: str | None = None, new_code: str | None = None) -> None:
     print(f"\n[处理] {bot}")
     if not bot.is_file():
         raise FileNotFoundError(f"找不到 .bot 文件：{bot}")
@@ -487,12 +589,34 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
         package_dir = locate_package_dir(root)
         print(f"  项目目录: {package_dir.relative_to(root)}")
 
+        original = json.loads((package_dir / "package.json").read_text(encoding="utf-8-sig"))
+        old_uuid = original.get("uuid")
+
+        if inspect:
+            inspect_bot(root, package_dir)
+            return
         if dry_run:
-            data = json.loads((package_dir / "package.json").read_text(encoding="utf-8-sig"))
-            keys = [k for k in data if re.search(r"id|uuid|version|name", k, re.I)]
-            print("  [dry-run] " + ", ".join(f"{k}={data[k]!r}" for k in keys))
+            keys = [k for k in original if re.search(r"id|uuid|version|name", k, re.I)]
+            print("  [dry-run] " + ", ".join(f"{k}={original[k]!r}" for k in keys))
             return
 
+        if new_uuid == "auto":
+            new_uuid = str(uuidlib.uuid4())
+            print(f"  自动生成新 uuid: {new_uuid}")
+        if new_code == "auto":
+            old_code = old_code or guess_activity_code(root)
+            if not old_code:
+                raise RuntimeError("未能自动识别指令集编码，请用 --old-code / --new-code 显式指定")
+            new_code = "activity_" + uuidlib.uuid4().hex[:8]
+            print(f"  自动识别指令集编码: {old_code} -> {new_code}")
+        elif new_code and not old_code:
+            old_code = guess_activity_code(root)
+            if old_code:
+                print(f"  自动识别旧指令集编码: {old_code}")
+
+        replace_identity(root, old_uuid, new_uuid, old_code, new_code)
+        rename_identity_paths(root, old_uuid, new_uuid, old_code, new_code)
+        package_dir = locate_package_dir(root)
         patch_package_json(package_dir, new_uuid, new_version)
         if do_sign:
             resign(package_dir, runtime, backup_root, dotnet, tfm)
@@ -515,20 +639,24 @@ def main() -> int:
     parser.add_argument("--runtime-dll", default=RUNTIME_DLL, help="ShadowBot.Runtime.dll 路径")
     parser.add_argument("--dotnet", default=DOTNET_EXE, help="dotnet.exe 绝对路径（自动探测失败时用）")
     parser.add_argument("--tfm", default=TFM, help="目标框架，如 net8.0 / net10.0（默认按已装 SDK 选择）")
+    parser.add_argument("--old-code", default=OLD_CODE, help="旧指令集编码（配合 --new-code）")
+    parser.add_argument("--new-code", default=NEW_CODE, help='新指令集编码；"auto" = 自动识别并替换')
+    parser.add_argument("--inspect", action="store_true", help="列出包结构与身份标识，不改动")
     parser.add_argument("--no-sign", action="store_true", help="跳过重签（实验用）")
     parser.add_argument("--dry-run", action="store_true", help="只看 package.json 关键字段，不改动")
     args = parser.parse_args()
 
-    do_sign = DO_SIGN and not args.no_sign
+    no_write = args.dry_run or args.inspect
+    do_sign = DO_SIGN and not args.no_sign and not no_write
     backup_root = Path.cwd() / "_sigstore_backups"
 
     try:
-        runtime = find_runtime(args.runtime_dll) if do_sign and not args.dry_run else None
+        runtime = find_runtime(args.runtime_dll) if do_sign else None
         if runtime:
             print(f"Runtime: {runtime}")
         dotnet = None
         tfm = args.tfm or TFM or "net10.0"
-        if do_sign and not args.dry_run:
+        if do_sign:
             dotnet, detected_tfm = find_dotnet(args.dotnet)
             tfm = args.tfm or TFM or detected_tfm
         if args.batch:
@@ -538,12 +666,14 @@ def main() -> int:
                 raise FileNotFoundError(f"目录下没有 .bot 文件：{directory}")
             for bot in bots:
                 process(bot, args.new_uuid, args.new_version, None,
-                        runtime, do_sign, args.dry_run, backup_root, dotnet, tfm)
+                        runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
+                        args.inspect, args.old_code, args.new_code)
         else:
             bot = Path(args.bot).expanduser()
             output = Path(args.output).expanduser() if args.output else None
             process(bot, args.new_uuid, args.new_version, output,
-                    runtime, do_sign, args.dry_run, backup_root, dotnet, tfm)
+                    runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
+                    args.inspect, args.old_code, args.new_code)
     except Exception as exc:
         print(f"\n[失败] {exc}", file=sys.stderr)
         return 1
