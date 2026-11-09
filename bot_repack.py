@@ -12,6 +12,8 @@
   - 影刀 5.23 起有应用签名校验，改完文件必须重签，否则打开时报「应用文件已损坏」。
   - 重签不是伪造签名：脚本调用本机 ShadowBot.Runtime.dll 的
     ShadowBot.Runtime.Packages.PackageHelper.WritePackageSigstore() 生成有效签名。
+  - 不同影刀版本的 Package 构造签名可能不同，C# 端会先试社区已知签名，
+    不匹配时自动枚举构造函数/方法并打印诊断信息。
 
 依赖（运行重签必须）：
   - Windows + 影刀客户端（提供 ShadowBot.Runtime.dll）
@@ -39,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 # ==================== 配置区：按需修改 ====================
@@ -73,7 +76,22 @@ using System.Text.Json;
 
 class Program
 {
-    static void Main(string[] args)
+    static int Main(string[] args)
+    {
+        try
+        {
+            Run(args);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("SIGSTORE_ERROR: " + ex.GetBaseException().Message);
+            Console.Error.WriteLine(ex.ToString());
+            return 2;
+        }
+    }
+
+    static void Run(string[] args)
     {
         var runtimePath = Path.GetFullPath(args[0]);
         var projectDir = Path.GetFullPath(args[1]);
@@ -107,31 +125,39 @@ class Program
 
         using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(projectDir, "package.json")));
         var rootElement = document.RootElement;
-        var appId = rootElement.GetProperty("uuid").GetString()!;
-        var appName = rootElement.GetProperty("name").GetString()!;
+        var appId = rootElement.GetProperty("uuid").GetString() ?? "";
+        var appName = rootElement.TryGetProperty("name", out var nameProp)
+            ? (nameProp.GetString() ?? "") : "";
 
         var assembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(runtimePath);
-        var appInfoType = assembly.GetType("ShadowBot.Runtime.Packages.PackageAppInfo")!;
-        var packageType = assembly.GetType("ShadowBot.Runtime.Packages.Package")!;
-        var helperType = assembly.GetType("ShadowBot.Runtime.Packages.PackageHelper")!;
+        var appInfoType = assembly.GetType("ShadowBot.Runtime.Packages.PackageAppInfo");
+        var packageType = assembly.GetType("ShadowBot.Runtime.Packages.Package");
+        var helperType = assembly.GetType("ShadowBot.Runtime.Packages.PackageHelper");
+        if (appInfoType == null || packageType == null || helperType == null)
+            throw new Exception("类型缺失: PackageAppInfo=" + (appInfoType != null)
+                + ", Package=" + (packageType != null)
+                + ", PackageHelper=" + (helperType != null));
+
+        var constructors = packageType.GetConstructors(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        Console.WriteLine("constructors=" + string.Join(" | ", constructors.Select(
+            c => string.Join(",", c.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name)))));
+        Console.WriteLine("sigstore methods=" + string.Join(" | ", helperType
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .Where(m => m.Name.IndexOf("Sigstore", StringComparison.OrdinalIgnoreCase) >= 0)
+            .Select(m => m.Name + "(" + string.Join(",", m.GetParameters()
+                .Select(p => p.ParameterType.Name)) + ")")));
 
         var appInfo = Activator.CreateInstance(appInfoType)!;
-        appInfoType.GetProperty("AppId")!.SetValue(appInfo, appId);
-        appInfoType.GetProperty("Name")!.SetValue(appInfo, appName);
+        SetStringProperty(appInfoType, appInfo, new[] { "AppId", "Id", "Uuid" }, appId);
+        SetStringProperty(appInfoType, appInfo, new[] { "Name", "AppName", "PackageName" }, appName);
 
-        var constructor = packageType.GetConstructor(
-            new[] { typeof(string), appInfoType, typeof(bool?), typeof(string), typeof(bool) })!;
-        var package = constructor.Invoke(new object?[]
-        {
-            Directory.GetParent(projectDir)!.FullName,
-            appInfo,
-            null,
-            Path.GetFileName(projectDir),
-            false
-        });
+        var parentDir = Directory.GetParent(projectDir)!.FullName;
+        var dirName = Path.GetFileName(projectDir);
+        var package = CreatePackage(packageType, appInfoType, appInfo, parentDir, dirName);
 
-        var test = helperType.GetMethod("TestPackageSigstore", BindingFlags.Public | BindingFlags.Static)!;
-        var write = helperType.GetMethod("WritePackageSigstore", BindingFlags.Public | BindingFlags.Static)!;
+        var test = FindSigstoreMethod(helperType, "TestPackageSigstore");
+        var write = FindSigstoreMethod(helperType, "WritePackageSigstore");
 
         Console.WriteLine("before=" + test.Invoke(null, new[] { package }));
         if (args.Length >= 3 && args[2] == "write")
@@ -140,8 +166,121 @@ class Program
             Console.WriteLine("after=" + test.Invoke(null, new[] { package }));
         }
     }
+
+    static void SetStringProperty(Type type, object instance, string[] candidates, string value)
+    {
+        foreach (var name in candidates)
+        {
+            var prop = type.GetProperty(name,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (prop != null && prop.CanWrite && prop.PropertyType == typeof(string))
+            {
+                prop.SetValue(instance, value);
+                Console.WriteLine("appInfo." + name + " set");
+                return;
+            }
+        }
+        Console.WriteLine("warn=string property not found: " + string.Join("/", candidates));
+    }
+
+    static object CreatePackage(Type packageType, Type appInfoType, object appInfo,
+                                string parentDir, string dirName)
+    {
+        var exact = packageType.GetConstructor(
+            new[] { typeof(string), appInfoType, typeof(bool?), typeof(string), typeof(bool) });
+        if (exact != null)
+        {
+            Console.WriteLine("ctor used=exact 5-arg signature");
+            return exact.Invoke(new object?[] { parentDir, appInfo, null, dirName, false })!;
+        }
+        Console.WriteLine("warn=exact 5-arg signature not found, probing constructors");
+
+        var constructors = packageType.GetConstructors(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var errors = new List<string>();
+        foreach (var ctor in constructors.OrderByDescending(c => c.GetParameters().Length))
+        {
+            var ps = ctor.GetParameters();
+            var vals = new object?[ps.Length];
+            int stringCount = 0;
+            bool skip = false;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var t = ps[i].ParameterType;
+                var n = ps[i].Name ?? "";
+                if (t == appInfoType || (t.IsAssignableFrom(appInfoType) && t != typeof(object)))
+                    vals[i] = appInfo;
+                else if (t == typeof(string))
+                {
+                    if (n.IndexOf("name", StringComparison.OrdinalIgnoreCase) >= 0
+                        || n.IndexOf("folder", StringComparison.OrdinalIgnoreCase) >= 0)
+                        vals[i] = dirName;
+                    else if (n.IndexOf("root", StringComparison.OrdinalIgnoreCase) >= 0
+                        || n.IndexOf("parent", StringComparison.OrdinalIgnoreCase) >= 0
+                        || n.IndexOf("base", StringComparison.OrdinalIgnoreCase) >= 0
+                        || n.IndexOf("path", StringComparison.OrdinalIgnoreCase) >= 0
+                        || n.IndexOf("dir", StringComparison.OrdinalIgnoreCase) >= 0)
+                        vals[i] = parentDir;
+                    else
+                        vals[i] = stringCount++ == 0 ? parentDir : dirName;
+                }
+                else if (t == typeof(bool)) vals[i] = false;
+                else if (t == typeof(bool?)) vals[i] = null;
+                else if (t == typeof(int)) vals[i] = 0;
+                else if (t == typeof(long)) vals[i] = 0L;
+                else if (t.IsValueType) { skip = true; break; }
+                else vals[i] = null;
+            }
+            if (skip) continue;
+            try
+            {
+                var instance = ctor.Invoke(vals);
+                Console.WriteLine("ctor used=" + string.Join(",",
+                    ps.Select(p => p.ParameterType.Name + " " + p.Name)));
+                return instance!;
+            }
+            catch (Exception ex)
+            {
+                errors.Add(string.Join(",", ps.Select(p => p.ParameterType.Name))
+                    + " -> " + ex.GetBaseException().Message);
+            }
+        }
+        throw new Exception("无法构造 Package。尝试结果：" + string.Join(" ; ", errors));
+    }
+
+    static MethodInfo FindSigstoreMethod(Type helperType, string name)
+    {
+        var candidates = helperType.GetMethods(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .Where(m => m.Name.IndexOf("Sigstore", StringComparison.OrdinalIgnoreCase) >= 0)
+            .ToList();
+        var method = candidates.FirstOrDefault(m => m.Name == name && m.GetParameters().Length == 1);
+        if (method == null)
+            throw new Exception("未找到单参数静态方法 " + name + "；候选："
+                + string.Join(" | ", candidates.Select(m => m.Name + "("
+                    + string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name)) + ")")));
+        return method;
+    }
 }
 '''
+
+
+def decode_console(data: bytes | None) -> str:
+    """中文 Windows 上 dotnet 输出可能是 UTF-8 或 GBK，逐个尝试，避免解码崩在 reader 线程。"""
+    if not data:
+        return ""
+    for encoding in ("utf-8", "gbk", "cp936"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def run_console(cmd: list[str], timeout: int) -> tuple[int, str, str]:
+    """字节捕获 + 手动解码，返回 (returncode, stdout, stderr)。"""
+    result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    return result.returncode, decode_console(result.stdout), decode_console(result.stderr)
 
 
 def find_runtime(explicit: str | None) -> Path:
@@ -201,15 +340,13 @@ def find_dotnet(explicit: str | None) -> tuple[Path, str]:
             continue
         seen.add(key)
         try:
-            result = subprocess.run(
-                [str(exe), "--list-sdks"], capture_output=True, text=True, timeout=30
-            )
+            code, out, _ = run_console([str(exe), "--list-sdks"], 30)
         except (OSError, subprocess.SubprocessError):
             continue
-        if result.returncode != 0:
+        if code != 0:
             continue
         versions = [tuple(int(n) for n in re.findall(r"\d+", line)[:3])
-                    for line in result.stdout.splitlines() if re.search(r"\d", line)]
+                    for line in out.splitlines() if re.search(r"\d", line)]
         versions = [v for v in versions if v]
         if versions:
             tfm = f"net{max(v[0] for v in versions)}.0"
@@ -265,7 +402,8 @@ def resign(project_dir: Path, runtime: Path, backup_root: Path,
     sigstore = project_dir / "package.sigstore"
     if sigstore.exists():
         backup_root.mkdir(parents=True, exist_ok=True)
-        backup = backup_root / f"{project_dir.name}.package.sigstore.bak"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = backup_root / f"{project_dir.name}.package.sigstore.{stamp}.bak"
         shutil.copy2(sigstore, backup)
         print(f"  已备份原签名: {backup}")
 
@@ -274,20 +412,23 @@ def resign(project_dir: Path, runtime: Path, backup_root: Path,
         (temp / "SigstoreRepair.csproj").write_text(
             CS_PROJECT.replace("{tfm}", tfm), encoding="utf-8")
         (temp / "Program.cs").write_text(CS_PROGRAM, encoding="utf-8")
-        result = subprocess.run(
+        code, out, err = run_console(
             [str(dotnet), "run", "--project", str(temp / "SigstoreRepair.csproj"),
              "--configuration", "Release", "--", str(runtime), str(project_dir), "write"],
-            capture_output=True, text=True, timeout=300,
+            300,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"重签失败（目标框架 {tfm}）：{result.stdout}\n{result.stderr}\n"
-                "若提示缺少 net8.0 参考包，可试 --tfm net10.0；反之可试 --tfm net8.0。"
-            )
-        for line in result.stdout.splitlines():
+        for line in out.splitlines():
             print("  " + line.strip())
-        if "before=" not in result.stdout or "after=True" not in result.stdout:
-            raise RuntimeError("重签未得到 after=True，请检查影刀版本与 Runtime 是否匹配。")
+        if code != 0:
+            raise RuntimeError(
+                f"重签失败（目标框架 {tfm}）：\n--- stdout ---\n{out}\n--- stderr ---\n{err}\n"
+                "若提示缺少参考包，可试 --tfm net8.0 / net10.0。"
+            )
+        if "before=" not in out or "after=True" not in out:
+            raise RuntimeError(
+                f"重签未得到 after=True，请检查影刀版本与 Runtime 是否匹配。\n"
+                f"--- stdout ---\n{out}\n--- stderr ---\n{err}"
+            )
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
