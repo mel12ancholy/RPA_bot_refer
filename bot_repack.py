@@ -22,10 +22,12 @@
   自动探测失败时用 --dotnet 手动指定；目标框架可用 --tfm 覆盖（默认按已装 SDK 选）。
 
 用法：
-  python bot_repack.py                          # 使用下方配置区
+  python bot_repack.py                          # 处理所在文件夹全部 .bot，输出到 repacked/
   python bot_repack.py --bot D:\\x\\my.bot --new-version 1.0.1
   python bot_repack.py --bot D:\\x\\my.bot --new-uuid abc123 --dry-run
   python bot_repack.py --batch D:\\bots --new-version 1.0.1
+
+  打包成 exe 与完整参数说明见 README.md。
 
 注意：仅限处理你自己/你公司有权分发的指令；绕过产品约束前请确认不违反适用许可协议。
 """
@@ -46,12 +48,14 @@ from datetime import datetime
 from pathlib import Path
 
 # ==================== 配置区：按需修改 ====================
-BOT_FILE = r"D:\影刀指令库\影刀_测试_26.11.1.bot"   # 待处理的 .bot 文件（单文件测试用）
+BOT_FILE = r"D:\影刀指令库\影刀_测试_26.11.1.bot"   # 【兼容保留】仅 --bot 单文件模式使用；无参数时忽略
 NEW_UUID = "auto"                    # "auto" = 每次生成全新 uuid（推荐）；None = 不改
-NEW_CODE = None                      # 新指令集编码；"auto" = 自动识别并替换 activity_xxx
+NEW_CODE = "auto"                    # "auto" = 自动识别并替换 activity_xxx；None = 不改
 OLD_CODE = None                      # 显式指定旧编码（配合 new-code）；None = 自动识别
-NEW_VERSION = "1.0.1"                # 新版本号；None = 不改
+NEW_VERSION = "auto"                 # "auto" = 原版本末位 +1；也可填 "26.11.2"；None = 不改
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
+SCAN_DIR = None                      # None = exe 所在文件夹；可填绝对路径
+OUTPUT_DIR = "repacked"              # 输出子目录名（相对扫描目录）
 RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
 DOTNET_EXE = None                    # None = 自动探测 dotnet.exe（不依赖 PATH）
 TFM = None                           # None = 按已装 SDK 自动选（如 net10.0）；可填 net8.0
@@ -408,6 +412,39 @@ def locate_package_dir(root: Path) -> Path:
     )
 
 
+def app_dir() -> Path:
+    """打包成 exe 后用 exe 所在目录，源码运行时用脚本所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bump_version(value) -> str | None:
+    """版本末位 +1，如 26.11.0 -> 26.11.1；非数字则保持原版本。"""
+    if value is None:
+        return None
+    parts = str(value).split(".")
+    try:
+        parts[-1] = str(int(parts[-1]) + 1)
+        return ".".join(parts)
+    except ValueError:
+        return None
+
+
+def unique_output_path(out_dir: Path, filename: str) -> Path:
+    """同名已存在时自动加 _2/_3，方便多次运行累积多份不同 uuid 的副本。"""
+    target = out_dir / filename
+    if not target.exists():
+        return target
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    index = 2
+    while True:
+        candidate = out_dir / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 TEXT_SUFFIXES = {".json", ".py", ".txt", ".xml", ".yaml", ".yml", ".md", ".js",
                  ".ini", ".cfg", ".config", ".flow", ".bat", ".ps1"}
 SKIP_FILES = {"package.sigstore"}
@@ -600,15 +637,21 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
             print("  [dry-run] " + ", ".join(f"{k}={original[k]!r}" for k in keys))
             return
 
+        if new_version == "auto":
+            new_version = bump_version(original.get("version"))
+            if new_version:
+                print(f"  自动递增版本: {original.get('version')} -> {new_version}")
         if new_uuid == "auto":
             new_uuid = str(uuidlib.uuid4())
             print(f"  自动生成新 uuid: {new_uuid}")
         if new_code == "auto":
             old_code = old_code or guess_activity_code(root)
             if not old_code:
-                raise RuntimeError("未能自动识别指令集编码，请用 --old-code / --new-code 显式指定")
-            new_code = "activity_" + uuidlib.uuid4().hex[:8]
-            print(f"  自动识别指令集编码: {old_code} -> {new_code}")
+                print("  [警告] 未识别到 activity_ 指令集编码，本次仅替换 uuid")
+                new_code = None
+            else:
+                new_code = "activity_" + uuidlib.uuid4().hex[:8]
+                print(f"  自动识别指令集编码: {old_code} -> {new_code}")
         elif new_code and not old_code:
             old_code = guess_activity_code(root)
             if old_code:
@@ -630,25 +673,30 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="修改并重新签名影刀 .bot 指令文件")
-    parser.add_argument("--bot", default=BOT_FILE, help="待处理的 .bot 文件路径")
-    parser.add_argument("--batch", help="批量处理该目录下所有 .bot 文件")
-    parser.add_argument("--new-uuid", default=NEW_UUID, help="新的指令集 id / uuid")
-    parser.add_argument("--new-version", default=NEW_VERSION, help="新的版本号")
-    parser.add_argument("--output", default=OUTPUT_FILE, help="输出 .bot 路径（单文件模式）")
+    parser = argparse.ArgumentParser(
+        description="修改并重新签名影刀 .bot 指令文件；无参数时处理程序所在文件夹下全部 .bot")
+    parser.add_argument("--bot", help="单文件模式：指定 .bot 路径")
+    parser.add_argument("--batch", help="【兼容】等同 --scan-dir")
+    parser.add_argument("--scan-dir", default=SCAN_DIR,
+                        help="扫描目录（默认 exe 所在文件夹）")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR,
+                        help="输出子目录（默认 repacked，相对扫描目录）")
+    parser.add_argument("--output", default=OUTPUT_FILE, help="输出 .bot 路径（仅单文件模式）")
+    parser.add_argument("--new-uuid", default=NEW_UUID, help='新 uuid；"auto" = 自动生成')
+    parser.add_argument("--new-version", default=NEW_VERSION, help='"auto" = 版本末位 +1')
     parser.add_argument("--runtime-dll", default=RUNTIME_DLL, help="ShadowBot.Runtime.dll 路径")
-    parser.add_argument("--dotnet", default=DOTNET_EXE, help="dotnet.exe 绝对路径（自动探测失败时用）")
-    parser.add_argument("--tfm", default=TFM, help="目标框架，如 net8.0 / net10.0（默认按已装 SDK 选择）")
-    parser.add_argument("--old-code", default=OLD_CODE, help="旧指令集编码（配合 --new-code）")
-    parser.add_argument("--new-code", default=NEW_CODE, help='新指令集编码；"auto" = 自动识别并替换')
+    parser.add_argument("--dotnet", default=DOTNET_EXE, help="dotnet.exe 绝对路径")
+    parser.add_argument("--tfm", default=TFM, help="目标框架，如 net8.0 / net10.0")
+    parser.add_argument("--old-code", default=OLD_CODE, help="旧指令集编码")
+    parser.add_argument("--new-code", default=NEW_CODE, help='"auto" = 自动识别并替换')
     parser.add_argument("--inspect", action="store_true", help="列出包结构与身份标识，不改动")
     parser.add_argument("--no-sign", action="store_true", help="跳过重签（实验用）")
-    parser.add_argument("--dry-run", action="store_true", help="只看 package.json 关键字段，不改动")
+    parser.add_argument("--dry-run", action="store_true", help="只看关键字段，不改动")
     args = parser.parse_args()
 
     no_write = args.dry_run or args.inspect
     do_sign = DO_SIGN and not args.no_sign and not no_write
-    backup_root = Path.cwd() / "_sigstore_backups"
+    backup_root = app_dir() / "_sigstore_backups"
 
     try:
         runtime = find_runtime(args.runtime_dll) if do_sign else None
@@ -659,25 +707,53 @@ def main() -> int:
         if do_sign:
             dotnet, detected_tfm = find_dotnet(args.dotnet)
             tfm = args.tfm or TFM or detected_tfm
-        if args.batch:
-            directory = Path(args.batch).expanduser()
-            bots = sorted(directory.glob("*.bot"))
-            if not bots:
-                raise FileNotFoundError(f"目录下没有 .bot 文件：{directory}")
-            for bot in bots:
-                process(bot, args.new_uuid, args.new_version, None,
-                        runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
-                        args.inspect, args.old_code, args.new_code)
-        else:
+
+        if args.bot:
             bot = Path(args.bot).expanduser()
             output = Path(args.output).expanduser() if args.output else None
             process(bot, args.new_uuid, args.new_version, output,
                     runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
                     args.inspect, args.old_code, args.new_code)
+            return 0
+
+        scan_target = args.scan_dir or args.batch
+        scan_dir = (Path(scan_target).expanduser().resolve()
+                    if scan_target else app_dir())
+        out_dir = Path(args.output_dir).expanduser()
+        if not out_dir.is_absolute():
+            out_dir = scan_dir / out_dir
+        if not no_write:
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+        bots = sorted(p for p in scan_dir.glob("*.bot") if p.is_file())
+        if not bots:
+            raise FileNotFoundError(f"目录下没有 .bot 文件：{scan_dir}")
+        print(f"扫描目录: {scan_dir}")
+        print(f"输出目录: {out_dir}")
+        print(f"找到 {len(bots)} 个 .bot 文件")
+
+        failures: list[tuple[str, str]] = []
+        for bot in bots:
+            target = unique_output_path(out_dir, bot.name) if not no_write else None
+            try:
+                process(bot, args.new_uuid, args.new_version, target,
+                        runtime, do_sign, args.dry_run, backup_root, dotnet, tfm,
+                        args.inspect, args.old_code, args.new_code)
+            except Exception as exc:
+                failures.append((bot.name, str(exc)))
+                print(f"  [失败] {bot.name}: {exc}", file=sys.stderr)
+
+        if no_write:
+            return 0
+        print(f"\n完成：成功 {len(bots) - len(failures)}/{len(bots)}，输出目录 {out_dir}")
+        if failures:
+            for name, reason in failures:
+                print(f"  失败：{name} -> {reason}", file=sys.stderr)
+            return 1
+        return 0
     except Exception as exc:
         print(f"\n[失败] {exc}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

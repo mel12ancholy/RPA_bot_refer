@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+*.exe
+repacked/
+_sigstore_backups/
+*.bot
+.idea/
