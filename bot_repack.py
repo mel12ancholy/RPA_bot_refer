@@ -15,8 +15,9 @@
 
 依赖（运行重签必须）：
   - Windows + 影刀客户端（提供 ShadowBot.Runtime.dll）
-  - .NET 8 SDK（dotnet --list-sdks 能列出内容）
+  - 任意 .NET SDK（8/9/10 均可；脚本自动探测 dotnet.exe 绝对路径，不依赖 PATH）
   缺少任一依赖时可用 --no-sign 只改包不签名，用于验证「导入层是否校验签名」。
+  自动探测失败时用 --dotnet 手动指定；目标框架可用 --tfm 覆盖（默认按已装 SDK 选）。
 
 用法：
   python bot_repack.py                          # 使用下方配置区
@@ -46,13 +47,15 @@ NEW_UUID = None                      # 新的指令集 id / uuid；None = 不改
 NEW_VERSION = "1.0.1"                # 新版本号；None = 不改
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
 RUNTIME_DLL = None                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
+DOTNET_EXE = None                    # None = 自动探测 dotnet.exe（不依赖 PATH）
+TFM = None                           # None = 按已装 SDK 自动选（如 net10.0）；可填 net8.0
 DO_SIGN = True                       # True = 改完重签；False = 只改包
 # ========================================================
 
 CS_PROJECT = """<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>{tfm}</TargetFramework>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -171,15 +174,54 @@ def find_runtime(explicit: str | None) -> Path:
     return candidates[0][1]
 
 
-def require_dotnet_sdk() -> None:
-    try:
-        result = subprocess.run(
-            ["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=30
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("未找到 dotnet 命令。重签需要 .NET 8 SDK：https://dotnet.microsoft.com/download") from exc
-    if result.returncode != 0 or not result.stdout.strip():
-        raise RuntimeError("dotnet 可用但没有安装 SDK。请安装 .NET 8 SDK 后重试，或使用 --no-sign 模式。")
+def find_dotnet(explicit: str | None) -> tuple[Path, str]:
+    """探测 dotnet.exe 与已装 SDK，返回 (exe, 自动目标框架)。不依赖 PATH。"""
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    which = shutil.which("dotnet")
+    if which:
+        candidates.append(Path(which))
+    envs = [os.environ.get("DOTNET_ROOT"), os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")]
+    for env in envs:
+        if env:
+            candidates.append(Path(env) / "dotnet.exe")
+            candidates.append(Path(env) / "dotnet" / "dotnet.exe")
+    candidates.append(Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "dotnet" / "dotnet.exe")
+    candidates.append(Path.home() / ".dotnet" / "dotnet.exe")
+
+    seen: set[str] = set()
+    for exe in candidates:
+        try:
+            key = str(exe.resolve()).lower()
+        except OSError:
+            continue
+        if not exe.is_file() or key in seen:
+            continue
+        seen.add(key)
+        try:
+            result = subprocess.run(
+                [str(exe), "--list-sdks"], capture_output=True, text=True, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        versions = [tuple(int(n) for n in re.findall(r"\d+", line)[:3])
+                    for line in result.stdout.splitlines() if re.search(r"\d", line)]
+        versions = [v for v in versions if v]
+        if versions:
+            tfm = f"net{max(v[0] for v in versions)}.0"
+            print(f"dotnet: {exe}")
+            print(f"SDK: {', '.join('.'.join(map(str, v)) for v in versions)} -> 使用 {tfm}")
+            return exe, tfm
+
+    raise RuntimeError(
+        "未找到可用的 dotnet SDK。请确认已安装 .NET SDK，"
+        '或用 --dotnet "C:/Program Files/dotnet/dotnet.exe" 手动指定；'
+        "也可加 --no-sign 先只改包不签名。"
+    )
 
 
 def locate_package_dir(root: Path) -> Path:
@@ -217,7 +259,8 @@ def patch_package_json(package_dir: Path, new_uuid: str | None, new_version: str
     print("  相关字段: " + ", ".join(f"{k}={data[k]!r}" for k in keys))
 
 
-def resign(project_dir: Path, runtime: Path, backup_root: Path) -> None:
+def resign(project_dir: Path, runtime: Path, backup_root: Path,
+           dotnet: Path, tfm: str) -> None:
     """调用影刀自己的 Runtime 生成 package.sigstore。"""
     sigstore = project_dir / "package.sigstore"
     if sigstore.exists():
@@ -228,15 +271,19 @@ def resign(project_dir: Path, runtime: Path, backup_root: Path) -> None:
 
     temp = Path(tempfile.mkdtemp(prefix="bot-sigstore-"))
     try:
-        (temp / "SigstoreRepair.csproj").write_text(CS_PROJECT, encoding="utf-8")
+        (temp / "SigstoreRepair.csproj").write_text(
+            CS_PROJECT.replace("{tfm}", tfm), encoding="utf-8")
         (temp / "Program.cs").write_text(CS_PROGRAM, encoding="utf-8")
         result = subprocess.run(
-            ["dotnet", "run", "--project", str(temp / "SigstoreRepair.csproj"),
+            [str(dotnet), "run", "--project", str(temp / "SigstoreRepair.csproj"),
              "--configuration", "Release", "--", str(runtime), str(project_dir), "write"],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"重签失败：{result.stdout}\n{result.stderr}")
+            raise RuntimeError(
+                f"重签失败（目标框架 {tfm}）：{result.stdout}\n{result.stderr}\n"
+                "若提示缺少 net8.0 参考包，可试 --tfm net10.0；反之可试 --tfm net8.0。"
+            )
         for line in result.stdout.splitlines():
             print("  " + line.strip())
         if "before=" not in result.stdout or "after=True" not in result.stdout:
@@ -254,14 +301,13 @@ def repack(extract_root: Path, output: Path) -> None:
 
 def process(bot: Path, new_uuid: str | None, new_version: str | None,
             output: Path | None, runtime: Path | None, do_sign: bool,
-            dry_run: bool, backup_root: Path) -> None:
+            dry_run: bool, backup_root: Path, dotnet: Path | None = None,
+            tfm: str = "net10.0") -> None:
     print(f"\n[处理] {bot}")
     if not bot.is_file():
         raise FileNotFoundError(f"找不到 .bot 文件：{bot}")
     if not zipfile.is_zipfile(bot):
         raise RuntimeError(f"不是有效的 zip/.bot 文件：{bot}")
-    if do_sign and not dry_run:
-        require_dotnet_sdk()
 
     with tempfile.TemporaryDirectory(prefix="bot-repack-") as tmp:
         root = Path(tmp)
@@ -278,7 +324,7 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
 
         patch_package_json(package_dir, new_uuid, new_version)
         if do_sign:
-            resign(package_dir, runtime, backup_root)
+            resign(package_dir, runtime, backup_root, dotnet, tfm)
         else:
             print("  [警告] 跳过重签；若导入后打开报「应用文件已损坏」，请去掉 --no-sign。")
 
@@ -296,6 +342,8 @@ def main() -> int:
     parser.add_argument("--new-version", default=NEW_VERSION, help="新的版本号")
     parser.add_argument("--output", default=OUTPUT_FILE, help="输出 .bot 路径（单文件模式）")
     parser.add_argument("--runtime-dll", default=RUNTIME_DLL, help="ShadowBot.Runtime.dll 路径")
+    parser.add_argument("--dotnet", default=DOTNET_EXE, help="dotnet.exe 绝对路径（自动探测失败时用）")
+    parser.add_argument("--tfm", default=TFM, help="目标框架，如 net8.0 / net10.0（默认按已装 SDK 选择）")
     parser.add_argument("--no-sign", action="store_true", help="跳过重签（实验用）")
     parser.add_argument("--dry-run", action="store_true", help="只看 package.json 关键字段，不改动")
     args = parser.parse_args()
@@ -307,6 +355,11 @@ def main() -> int:
         runtime = find_runtime(args.runtime_dll) if do_sign and not args.dry_run else None
         if runtime:
             print(f"Runtime: {runtime}")
+        dotnet = None
+        tfm = args.tfm or TFM or "net10.0"
+        if do_sign and not args.dry_run:
+            dotnet, detected_tfm = find_dotnet(args.dotnet)
+            tfm = args.tfm or TFM or detected_tfm
         if args.batch:
             directory = Path(args.batch).expanduser()
             bots = sorted(directory.glob("*.bot"))
@@ -314,12 +367,12 @@ def main() -> int:
                 raise FileNotFoundError(f"目录下没有 .bot 文件：{directory}")
             for bot in bots:
                 process(bot, args.new_uuid, args.new_version, None,
-                        runtime, do_sign, args.dry_run, backup_root)
+                        runtime, do_sign, args.dry_run, backup_root, dotnet, tfm)
         else:
             bot = Path(args.bot).expanduser()
             output = Path(args.output).expanduser() if args.output else None
             process(bot, args.new_uuid, args.new_version, output,
-                    runtime, do_sign, args.dry_run, backup_root)
+                    runtime, do_sign, args.dry_run, backup_root, dotnet, tfm)
     except Exception as exc:
         print(f"\n[失败] {exc}", file=sys.stderr)
         return 1
