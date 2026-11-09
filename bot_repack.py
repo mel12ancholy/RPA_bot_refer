@@ -45,11 +45,11 @@ from datetime import datetime
 from pathlib import Path
 
 # ==================== 配置区：按需修改 ====================
-BOT_FILE = r"D:\path\to\your.bot"   # 待处理的 .bot 文件（单文件测试用）
+BOT_FILE = r"D:\影刀指令库\影刀_测试_26.11.1.bot"   # 待处理的 .bot 文件（单文件测试用）
 NEW_UUID = None                      # 新的指令集 id / uuid；None = 不改
 NEW_VERSION = "1.0.1"                # 新版本号；None = 不改
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
-RUNTIME_DLL = None                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
+RUNTIME_DLL = "E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runtime.dll"                   # None = 自动探测已安装影刀的 ShadowBot.Runtime.dll
 DOTNET_EXE = None                    # None = 自动探测 dotnet.exe（不依赖 PATH）
 TFM = None                           # None = 按已装 SDK 自动选（如 net10.0）；可填 net8.0
 DO_SIGN = True                       # True = 改完重签；False = 只改包
