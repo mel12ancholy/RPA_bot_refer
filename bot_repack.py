@@ -524,6 +524,8 @@ def unique_output_path(out_dir: Path, filename: str) -> Path:
 TEXT_SUFFIXES = {".json", ".py", ".txt", ".xml", ".yaml", ".yml", ".md", ".js",
                  ".ini", ".cfg", ".config", ".flow", ".bat", ".ps1"}
 SKIP_FILES = {"package.sigstore"}
+SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+                 ".mp4", ".zip", ".7z", ".rar", ".gz"}
 
 
 def iter_text_files(root: Path):
@@ -584,7 +586,8 @@ def guess_activity_code(root: Path, package_dir: Path | None = None) -> str | No
 
 def replace_identity(root: Path, old_uuid: str | None, new_uuid: str | None,
                      old_code: str | None, new_code: str | None,
-                     extra_uuids: dict[str, str] | None = None) -> None:
+                     extra_uuids: dict[str, str] | None = None,
+                     extra_codes: dict[str, str] | None = None) -> None:
     """按字节替换全包身份标识，覆盖 .pybx / .flow 等二进制或加密文件。
 
     uuid 与指令集编码都是 ASCII，等长替换不会破坏二进制结构；
@@ -598,10 +601,15 @@ def replace_identity(root: Path, old_uuid: str | None, new_uuid: str | None,
     for old, new in (extra_uuids or {}).items():
         if old and new and old != new and old != old_uuid:
             pairs.append((old.encode(), new.encode(), "子包uuid"))
+    for old, new in (extra_codes or {}).items():
+        if old and new and old != new and old != old_code:
+            pairs.append((old.encode(), new.encode(), "子包编码"))
     if not pairs:
         return
     for file in sorted(root.rglob("*")):
         if not file.is_file() or file.name in SKIP_FILES:
+            continue
+        if file.suffix.lower() in SKIP_SUFFIXES:
             continue
         if file.stat().st_size > 100 * 1024 * 1024:
             print(f"  跳过超大文件: {file.relative_to(root).as_posix()}")
@@ -639,14 +647,46 @@ def collect_package_uuids(root: Path, primary_dir: Path) -> dict[str, str]:
     return mapping
 
 
+def collect_package_codes(root: Path, primary_dir: Path) -> dict[str, str]:
+    """收集子包（xbot_extensions 等）的指令集编码，各自映射到新值。
+
+    一个 .bot 可能内嵌多个依赖指令集，导入时它们会一并注册；
+    子包编码不改的话，组织里已存在就会报「packageCode 已存在」。
+    """
+    mapping: dict[str, str] = {}
+    for path in sorted(root.rglob("package.json")):
+        if path.parent == primary_dir:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (UnicodeDecodeError, OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        code = None
+        for key in CODE_KEYS:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                code = value.strip()
+                break
+        if code and code not in mapping:
+            mapping[code] = "activity_" + uuidlib.uuid4().hex[:6]
+            print(f"  子包编码: {path.relative_to(root).as_posix()} {code} -> {mapping[code]}")
+    return mapping
+
+
 def rename_identity_paths(root: Path, old_uuid: str | None, new_uuid: str | None,
-                          old_code: str | None, new_code: str | None) -> None:
+                          old_code: str | None, new_code: str | None,
+                          extra_codes: dict[str, str] | None = None) -> None:
     """指令集编码常出现在目录名/文件名里（如 xbot_extensions/<code>/），同步重命名。"""
     pairs = []
     if old_uuid and new_uuid and old_uuid != new_uuid:
         pairs.append((old_uuid, new_uuid))
     if old_code and new_code and old_code != new_code:
         pairs.append((old_code, new_code))
+    for old, new in (extra_codes or {}).items():
+        if old and new and old != new and old != old_code:
+            pairs.append((old, new))
     if not pairs:
         return
     entries = sorted([p for p in root.rglob("*")
@@ -835,8 +875,9 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
                 print(f"  自动识别旧指令集编码: {old_code}")
 
         extra_uuids = collect_package_uuids(root, package_dir)
-        replace_identity(root, old_uuid, new_uuid, old_code, new_code, extra_uuids)
-        rename_identity_paths(root, old_uuid, new_uuid, old_code, new_code)
+        extra_codes = collect_package_codes(root, package_dir)
+        replace_identity(root, old_uuid, new_uuid, old_code, new_code, extra_uuids, extra_codes)
+        rename_identity_paths(root, old_uuid, new_uuid, old_code, new_code, extra_codes)
         package_dir = locate_package_dir(root)
         patch_package_json(package_dir, new_uuid, new_version)
         if do_sign:

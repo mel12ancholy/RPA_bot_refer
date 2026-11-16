@@ -173,7 +173,7 @@ python bot_repack.py --no-sign
 
 1. 解包 `.bot`（本质是 zip），定位主 `package.json`。
 2. 生成新 `uuid`，对**包内所有文件做字节级替换**（含 `.pybx`、`.flow` 等二进制/加密文件，`package.sigstore` 除外）。uuid 是 ASCII，等长替换不会破坏二进制结构；只替换文本文件会漏掉加密流程里内嵌的旧 id。
-3. 收集所有子 `package.json`（`xbot_extensions` 等）的 uuid，各自生成新值并同步替换引用，保证 `topicUuid` 与子包 uuid 一致。
+3. 收集所有子 `package.json`（`xbot_extensions` 等）的 **uuid 与指令集编码**，各自生成新值并同步替换引用。内嵌的依赖指令集在导入时会一并注册，子包编码不改仍会报「packageCode 已存在」。
 4. 自动识别指令集编码并替换：**优先读 `package.json` 的 `packageCode` / `code` 字段**（编码可以自定义，不一定以 `activity_` 开头），兜底才按 `activity_` 前缀统计；同步重命名含编码的目录/文件名。
 5. 版本号默认生成唯一值（`主.次.月日`，不超过 **10 字符**，影刀硬限制）。
 6. 加载影刀自带的 `ShadowBot.Runtime.dll`，调用 `PackageHelper.WritePackageSigstore()` 重新生成有效签名（**不是伪造签名**，用的是影刀自己的 API），并校验 `after=True`。
