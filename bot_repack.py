@@ -52,7 +52,7 @@ BOT_FILE = r"D:\影刀指令库\影刀_测试_26.11.1.bot"   # 【兼容保留�
 NEW_UUID = "auto"                    # "auto" = 每次生成全新 uuid（推荐）；None = 不改
 NEW_CODE = "auto"                    # "auto" = 自动识别并替换 activity_xxx；None = 不改
 OLD_CODE = None                      # 显式指定旧编码（配合 new-code）；None = 自动识别
-NEW_VERSION = "auto"                 # "auto" = 原版本末位 +1；也可填 "26.11.2"；None = 不改
+NEW_VERSION = "unique"               # "unique" = 月日时分秒唯一版本；"auto" = 末位 +1；也可填固定值
 OUTPUT_FILE = None                   # None = 原文件名 + _repacked.bot
 SCAN_DIR = None                      # None = exe 所在文件夹；可填绝对路径
 OUTPUT_DIR = "repacked"              # 输出子目录名（相对扫描目录）
@@ -482,6 +482,22 @@ def bump_version(value) -> str | None:
         return None
 
 
+def unique_version(value) -> str | None:
+    """生成不会与已有版本重复的版本号：保留前两段，第三段用月日时分秒。
+
+    反复对同一个源文件转换时，末位 +1 会一直得到同一个版本号，
+    若组织里已存在该版本，导入就会持续报冲突。
+    """
+    if value is None:
+        return None
+    parts = str(value).split(".")
+    now = datetime.now()
+    stamp = now.strftime("%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
+    if len(parts) >= 2:
+        return f"{parts[0]}.{parts[1]}.{stamp}"
+    return f"{parts[0]}.{stamp}"
+
+
 def unique_output_path(out_dir: Path, filename: str) -> Path:
     """同名已存在时自动加 _2/_3，方便多次运行累积多份不同 uuid 的副本。"""
     target = out_dir / filename
@@ -525,25 +541,60 @@ def guess_activity_code(root: Path) -> str | None:
 
 
 def replace_identity(root: Path, old_uuid: str | None, new_uuid: str | None,
-                     old_code: str | None, new_code: str | None) -> None:
-    """全包替换身份标识：只改 package.json 的 uuid 会留下内部引用不一致。"""
-    pairs = []
+                     old_code: str | None, new_code: str | None,
+                     extra_uuids: dict[str, str] | None = None) -> None:
+    """按字节替换全包身份标识，覆盖 .pybx / .flow 等二进制或加密文件。
+
+    uuid 与指令集编码都是 ASCII，等长替换不会破坏二进制结构；
+    只按文本白名单替换会漏掉加密流程文件里内嵌的旧 id。
+    """
+    pairs: list[tuple[bytes, bytes, str]] = []
     if old_uuid and new_uuid and old_uuid != new_uuid:
-        pairs.append((old_uuid, new_uuid, "uuid"))
+        pairs.append((old_uuid.encode(), new_uuid.encode(), "uuid"))
     if old_code and new_code and old_code != new_code:
-        pairs.append((old_code, new_code, "编码"))
+        pairs.append((old_code.encode(), new_code.encode(), "编码"))
+    for old, new in (extra_uuids or {}).items():
+        if old and new and old != new and old != old_uuid:
+            pairs.append((old.encode(), new.encode(), "子包uuid"))
     if not pairs:
         return
-    for file, text in iter_text_files(root):
-        updated, hits = text, []
-        for old, new, label in pairs:
-            count = updated.count(old)
+    for file in sorted(root.rglob("*")):
+        if not file.is_file() or file.name in SKIP_FILES:
+            continue
+        if file.stat().st_size > 100 * 1024 * 1024:
+            print(f"  跳过超大文件: {file.relative_to(root).as_posix()}")
+            continue
+        raw = file.read_bytes()
+        updated, hits = raw, []
+        for old_bytes, new_bytes, label in pairs:
+            count = updated.count(old_bytes)
             if count:
-                updated = updated.replace(old, new)
+                updated = updated.replace(old_bytes, new_bytes)
                 hits.append(f"{label}x{count}")
         if hits:
-            file.write_text(updated, encoding="utf-8")
+            file.write_bytes(updated)
             print(f"  替换 {file.relative_to(root).as_posix()}: {', '.join(hits)}")
+
+
+def collect_package_uuids(root: Path, primary_dir: Path) -> dict[str, str]:
+    """收集其它 package.json 的 uuid，各自映射到新值。
+
+    一个 .bot 里可能不止一个 package.json（xbot_extensions 子包等），
+    导入时若读到未替换的那一份，仍然会报版本冲突。
+    """
+    mapping: dict[str, str] = {}
+    for path in sorted(root.rglob("package.json")):
+        if path.parent == primary_dir:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (UnicodeDecodeError, OSError, json.JSONDecodeError):
+            continue
+        old = data.get("uuid") if isinstance(data, dict) else None
+        if isinstance(old, str) and old and old not in mapping:
+            mapping[old] = str(uuidlib.uuid4())
+            print(f"  子包 uuid: {path.relative_to(root).as_posix()} {old} -> {mapping[old]}")
+    return mapping
 
 
 def rename_identity_paths(root: Path, old_uuid: str | None, new_uuid: str | None,
@@ -585,11 +636,24 @@ def inspect_bot(root: Path, package_dir: Path) -> None:
         print(f"    ... 另有 {len(files) - 60} 个")
     code = guess_activity_code(root)
     print(f"  疑似指令集编码: {code or '未找到 activity_ 前缀字符串'}")
+    print("  所有 package.json:")
+    for path in sorted(root.rglob("package.json")):
+        try:
+            item = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (UnicodeDecodeError, OSError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            print(f"    {path.relative_to(root).as_posix()}: uuid={item.get('uuid')!r} "
+                  f"version={item.get('version')!r} name={item.get('name')!r} "
+                  f"code={item.get('code')!r}")
     old_uuid = data.get("uuid")
     if old_uuid:
-        locations = [f.relative_to(root).as_posix()
-                     for f, text in iter_text_files(root) if old_uuid in text]
-        print(f"  旧 uuid 出现位置: {', '.join(locations) if locations else '未出现在文本文件中'}")
+        needle = old_uuid.encode()
+        locations = []
+        for file in sorted(root.rglob("*")):
+            if file.is_file() and file.name not in SKIP_FILES and needle in file.read_bytes():
+                locations.append(file.relative_to(root).as_posix())
+        print(f"  旧 uuid 出现位置(全文件): {', '.join(locations) if locations else '未出现'}")
 
 
 def patch_package_json(package_dir: Path, new_uuid: str | None, new_version: str | None) -> None:
@@ -697,10 +761,17 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
             print("  [dry-run] " + ", ".join(f"{k}={original[k]!r}" for k in keys))
             return
 
+        print(f"  原始标识: name={original.get('name')!r} version={original.get('version')!r} "
+              f"uuid={old_uuid!r} code={original.get('code')!r}")
+
         if new_version == "auto":
             new_version = bump_version(original.get("version"))
             if new_version:
                 print(f"  自动递增版本: {original.get('version')} -> {new_version}")
+        elif new_version == "unique":
+            new_version = unique_version(original.get("version"))
+            if new_version:
+                print(f"  唯一化版本: {original.get('version')} -> {new_version}")
         if new_uuid == "auto":
             new_uuid = str(uuidlib.uuid4())
             print(f"  自动生成新 uuid: {new_uuid}")
@@ -717,7 +788,8 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
             if old_code:
                 print(f"  自动识别旧指令集编码: {old_code}")
 
-        replace_identity(root, old_uuid, new_uuid, old_code, new_code)
+        extra_uuids = collect_package_uuids(root, package_dir)
+        replace_identity(root, old_uuid, new_uuid, old_code, new_code, extra_uuids)
         rename_identity_paths(root, old_uuid, new_uuid, old_code, new_code)
         package_dir = locate_package_dir(root)
         patch_package_json(package_dir, new_uuid, new_version)
