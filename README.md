@@ -41,7 +41,7 @@ RUNTIME_DLL = r"E:\shadowbot\ShadowBot Private\shadowbot-5.25.66\ShadowBot.Runti
 | --- | --- | --- |
 | `NEW_UUID` | `"auto"` | 每个文件生成全新 uuid；`None` = 不改 |
 | `NEW_CODE` | `"auto"` | 自动识别并替换 `activity_xxx` 指令集编码；`None` = 不改 |
-| `NEW_VERSION` | `"unique"` | 生成唯一版本（`主.次.月日时分秒毫秒`）；`"auto"` = 末位 +1；也可填 `"26.11.2"` |
+| `NEW_VERSION` | `"unique"` | 生成唯一版本（`主.次.月日`，**≤10 字符**）；`"auto"` = 末位 +1；也可填固定值（≤10 字符） |
 | `OUTPUT_DIR` | `"repacked"` | 输出子目录名 |
 | `SCAN_DIR` | `None` | 默认 exe 所在文件夹 |
 | `DO_SIGN` | `True` | 是否重签；改成 `False` 只改包不签名 |
@@ -174,8 +174,8 @@ python bot_repack.py --no-sign
 1. 解包 `.bot`（本质是 zip），定位主 `package.json`。
 2. 生成新 `uuid`，对**包内所有文件做字节级替换**（含 `.pybx`、`.flow` 等二进制/加密文件，`package.sigstore` 除外）。uuid 是 ASCII，等长替换不会破坏二进制结构；只替换文本文件会漏掉加密流程里内嵌的旧 id。
 3. 收集所有子 `package.json`（`xbot_extensions` 等）的 uuid，各自生成新值并同步替换引用，保证 `topicUuid` 与子包 uuid 一致。
-4. 自动识别 `activity_xxx` 指令集编码并替换，同步重命名含编码的目录/文件名。
-5. 版本号默认生成唯一值（`主.次.月日时分秒毫秒`），避免反复转换同一个源文件时版本号撞车。
+4. 自动识别指令集编码并替换：**优先读 `package.json` 的 `packageCode` / `code` 字段**（编码可以自定义，不一定以 `activity_` 开头），兜底才按 `activity_` 前缀统计；同步重命名含编码的目录/文件名。
+5. 版本号默认生成唯一值（`主.次.月日`，不超过 **10 字符**，影刀硬限制）。
 6. 加载影刀自带的 `ShadowBot.Runtime.dll`，调用 `PackageHelper.WritePackageSigstore()` 重新生成有效签名（**不是伪造签名**，用的是影刀自己的 API），并校验 `after=True`。
 7. 重新打包为 `.bot`。
 
@@ -189,6 +189,7 @@ python bot_repack.py --no-sign
 - **更省事的官方通道**：同一企业组织内分发，推荐走「我开发的指令 → 发版 → 分享至企业 → B 账号在『企业指令』安装」，天然支持一个指令集多账号安装，不需要生成多份文件。本工具适合跨组织、离线交付等场景。
 - 重签依赖 .NET SDK 与影刀客户端；缺少任一项时可用 `--no-sign` 先验证导入层是否校验签名。
 - 改 `NEW_CODE` 会影响 `prototype.block.json` 等处；若发现指令调用异常，可先 `--inspect` 查看编码位置，或把 `NEW_CODE` 改为 `None` 只换 uuid。
-- **版本策略**：`NEW_VERSION="unique"`（默认）每次生成唯一版本，适合反复转换；`"auto"` 只做末位 +1，反复转换同一个源文件会一直得到同一个版本号，若组织里已存在该版本就会持续报「版本冲突」。
+- **版本策略**：影刀限制版本号 **≤10 字符**，超长会报「版本长度不能超过10个字符」。`NEW_VERSION="unique"`（默认）生成 `主.次.月日`，每次转换都不同；`"auto"` 只做末位 +1，反复转换同一个源文件会一直得到同一个版本号，若组织里已存在该版本就会持续报「版本冲突」。
+- **报「packageCode 已存在」**：说明指令集编码没被替换。先用 `--inspect` 看 `所有 package.json` 里的 `code=` 是否等于报错信息里的编码；若脚本识别到的编码与你实际的不同，用 `--old-code` / `--new-code` 显式指定。
 - **仍报版本冲突时**：先用 `--inspect` 看两处输出——`所有 package.json` 里每个 uuid 是否都被换掉、`旧 uuid 出现位置(全文件)` 是否覆盖完整。若包里存在脚本识别不到的编码（非 `activity_` 前缀），用 `--old-code` / `--new-code` 显式指定。
 - `.gitignore` 已排除 `*.exe`、`build/`、`dist/`、`*.spec`、`repacked/`、`_sigstore_backups/`、`*.bot` 等，避免误提交二进制与签名备份。

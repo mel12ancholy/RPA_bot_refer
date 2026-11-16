@@ -482,20 +482,29 @@ def bump_version(value) -> str | None:
         return None
 
 
-def unique_version(value) -> str | None:
-    """生成不会与已有版本重复的版本号：保留前两段，第三段用月日时分秒。
+def unique_version(value, max_len: int = 10) -> str | None:
+    """生成不超过 10 字符、且尽量不重复的版本号（影刀限制版本 ≤10 字符）。
 
+    保留主/次版本，修订号用「月日」（4 位）；主/次过长时依次压缩。
     反复对同一个源文件转换时，末位 +1 会一直得到同一个版本号，
     若组织里已存在该版本，导入就会持续报冲突。
     """
     if value is None:
         return None
     parts = str(value).split(".")
-    now = datetime.now()
-    stamp = now.strftime("%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
-    if len(parts) >= 2:
-        return f"{parts[0]}.{parts[1]}.{stamp}"
-    return f"{parts[0]}.{stamp}"
+    major = parts[0] if parts and parts[0] else "1"
+    minor = parts[1] if len(parts) > 1 and parts[1] else "0"
+    stamp = datetime.now().strftime("%m%d")
+    candidates = [
+        f"{major}.{minor}.{stamp}",
+        f"{major[-2:]}.{minor[-2:]}.{stamp}",
+        f"{major[-1:]}.{minor[-1:]}.{stamp}",
+        f"1.0.{stamp}",
+    ]
+    for candidate in candidates:
+        if len(candidate) <= max_len:
+            return candidate
+    return f"1.0.{stamp}"[:max_len]
 
 
 def unique_output_path(out_dir: Path, filename: str) -> Path:
@@ -531,13 +540,46 @@ def iter_text_files(root: Path):
         yield file, text
 
 
-def guess_activity_code(root: Path) -> str | None:
-    """从包内文本中找出出现最多的 activity_xxx 作为指令集编码。"""
+CODE_KEYS = ("packageCode", "code", "activityCode", "package_code", "activity_code")
+
+
+def read_package_code(package_dir: Path) -> str | None:
+    """从 package.json 读指令集编码；真实字段名可能是 packageCode / code 等。"""
+    try:
+        data = json.loads((package_dir / "package.json").read_text(encoding="utf-8-sig"))
+    except (UnicodeDecodeError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in CODE_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def guess_activity_code(root: Path, package_dir: Path | None = None) -> str | None:
+    """优先读 package.json 的编码字段，其次按 activity_ 前缀统计，最后看扩展目录名。
+
+    指令集编码不一定以 activity_ 开头（可以自定义），只靠正则会漏掉，
+    导致编码没被替换、导入时报「packageCode 已存在」。
+    """
+    if package_dir is not None:
+        code = read_package_code(package_dir)
+        if code:
+            return code
     counts: dict[str, int] = {}
     for _, text in iter_text_files(root):
         for code in set(re.findall(r"\bactivity_[A-Za-z0-9_]+\b", text)):
             counts[code] = counts.get(code, 0) + text.count(code)
-    return max(counts, key=counts.get) if counts else None
+    if counts:
+        return max(counts, key=counts.get)
+    extensions = root / "xbot_extensions"
+    if extensions.is_dir():
+        for child in sorted(extensions.iterdir()):
+            if child.is_dir() and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", child.name):
+                return child.name
+    return None
 
 
 def replace_identity(root: Path, old_uuid: str | None, new_uuid: str | None,
@@ -634,7 +676,7 @@ def inspect_bot(root: Path, package_dir: Path) -> None:
         print(f"    {file.relative_to(root).as_posix()}")
     if len(files) > 60:
         print(f"    ... 另有 {len(files) - 60} 个")
-    code = guess_activity_code(root)
+    code = guess_activity_code(root, package_dir)
     print(f"  疑似指令集编码: {code or '未找到 activity_ 前缀字符串'}")
     print("  所有 package.json:")
     for path in sorted(root.rglob("package.json")):
@@ -645,7 +687,7 @@ def inspect_bot(root: Path, package_dir: Path) -> None:
         if isinstance(item, dict):
             print(f"    {path.relative_to(root).as_posix()}: uuid={item.get('uuid')!r} "
                   f"version={item.get('version')!r} name={item.get('name')!r} "
-                  f"code={item.get('code')!r}")
+                  f"code={read_package_code(path.parent)!r}")
     old_uuid = data.get("uuid")
     if old_uuid:
         needle = old_uuid.encode()
@@ -668,6 +710,10 @@ def patch_package_json(package_dir: Path, new_uuid: str | None, new_version: str
     if new_version:
         old = data.get("version")
         if old != new_version:
+            if len(str(new_version)) > 10:
+                raise RuntimeError(
+                    f"版本号不能超过 10 个字符：{new_version!r}（当前 {len(str(new_version))} 字符）"
+                )
             data["version"] = new_version
             changed.append(f"version: {old} -> {new_version}")
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -762,7 +808,7 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
             return
 
         print(f"  原始标识: name={original.get('name')!r} version={original.get('version')!r} "
-              f"uuid={old_uuid!r} code={original.get('code')!r}")
+              f"uuid={old_uuid!r} code={read_package_code(package_dir)!r}")
 
         if new_version == "auto":
             new_version = bump_version(original.get("version"))
@@ -776,15 +822,15 @@ def process(bot: Path, new_uuid: str | None, new_version: str | None,
             new_uuid = str(uuidlib.uuid4())
             print(f"  自动生成新 uuid: {new_uuid}")
         if new_code == "auto":
-            old_code = old_code or guess_activity_code(root)
+            old_code = old_code or guess_activity_code(root, package_dir)
             if not old_code:
                 print("  [警告] 未识别到 activity_ 指令集编码，本次仅替换 uuid")
                 new_code = None
             else:
-                new_code = "activity_" + uuidlib.uuid4().hex[:8]
+                new_code = "activity_" + uuidlib.uuid4().hex[:6]
                 print(f"  自动识别指令集编码: {old_code} -> {new_code}")
         elif new_code and not old_code:
-            old_code = guess_activity_code(root)
+            old_code = guess_activity_code(root, package_dir)
             if old_code:
                 print(f"  自动识别旧指令集编码: {old_code}")
 
